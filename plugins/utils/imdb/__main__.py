@@ -106,10 +106,9 @@ async def get_movie_description(imdb_id, max_length):
 <b>Date: </b><code>{date_pub}</code>
 <b>Genres: </b><code>{' '.join(genres) if len(genres) > 0 else ''}</code>
 <b>Rating⭐: </b><code>{mov_rating}</code>
-<b>Cast Info🎗: </b>
-  <b>Director📽: </b><code>{director}</code>
-  <b>Writer📄: </b><code>{writer}</code>
-  <b>Stars🎭: </b><code>{stars}</code>
+<b>Director📽: </b><code>{director}</code>
+<b>Writer📄: </b><code>{writer}</code>
+<b>Stars🎭: </b><code>{stars}</code>
 
 <b>IMDB URL Link🔗: </b>{mov_link}
 
