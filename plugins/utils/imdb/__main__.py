@@ -86,7 +86,7 @@ async def get_movie_description(imdb_id, max_length):
     image_link = soup.get('poster')
     genres = soup.get("genres")
     duration = soup.get("duration")
-    date_pub = soup.get("datePublished")
+    date_pub = soup.get("year")
     mov_rating = soup.get("UserRating").get("rating")
     if mov_rating.strip() == '/':
         mov_rating = "<code>Ratings not found!</code>"
