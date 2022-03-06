@@ -101,8 +101,9 @@ async def get_movie_description(imdb_id, max_length):
     director, writer, stars = get_credits_text(soup)
     story_line = soup.get("summary").get("plot", 'Not available')
 
-    description = f"<b>Title</b><a href='{image_link}'>🎬</a>: <code>{mov_name} ({date_pub})</code>"
+    description = f"<b>Title</b><a href='{image_link}'>🎬</a>: <code>{mov_name}</code>"
     description += f"""
+<b>Date: </b><code>{date_pub}</code>
 <b>Genres: </b><code>{' '.join(genres) if len(genres) > 0 else ''}</code>
 <b>Rating⭐: </b><code>{mov_rating}</code>
 <b>Cast Info🎗: </b>
