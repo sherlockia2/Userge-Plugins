@@ -11,7 +11,10 @@
 import logging
 import os
 
+from userge.utils import secured_env
+
 logging.getLogger("pytgcalls").setLevel(logging.WARNING)
 
 YTDL_PATH = os.environ.get("YOUTUBE_DL_PATH", "yt_dlp")
 MAX_DURATION = int(os.environ.get("MAX_DURATION", 900))
+VC_SESSION = secured_env("VC_SESSION_STRING")
