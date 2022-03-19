@@ -6,8 +6,4 @@
 #
 # All rights reserved.
 
-""" ocr reader """
-
-from userge.utils import secured_env
-
-OCR_SPACE_API_KEY = secured_env("OCR_SPACE_API_KEY")
+""" send a secret msg """

@@ -13,30 +13,33 @@
 import os
 import re
 import json
-import time
 import math
+import time
 import shlex
 import shutil
+import random
 import asyncio
-import requests
+
+from json.decoder import JSONDecodeError
 from pathlib import Path
 from traceback import format_exc
 from typing import List, Tuple, Optional
-from json.decoder import JSONDecodeError
-from youtubesearchpython import VideosSearch
 
-from pyrogram import ContinuePropagation
+import requests
+from pyrogram import ContinuePropagation, Client
+from pyrogram.errors import (
+    MessageNotModified, QueryIdInvalid,
+    ChannelInvalid, ChannelPrivate, ChatAdminRequired,
+    UserAlreadyParticipant, UserBannedInChannel)
 from pyrogram.raw import functions
 from pyrogram.raw.base import Message as BaseMessage
 from pyrogram.raw.functions.phone import GetGroupCall
 from pyrogram.raw.types import UpdateGroupCallParticipants, InputGroupCall, GroupCall
-from pyrogram.errors import MessageNotModified, QueryIdInvalid
 from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
     Message as RawMessage)
-
 from pytgcalls import PyTgCalls, StreamType
 from pytgcalls.exceptions import (
     NodeJSNotInstalled,
@@ -57,36 +60,40 @@ from pytgcalls.types.input_stream import (
     AudioPiped,
     VideoParameters
 )
+from youtubesearchpython import VideosSearch
 
 from userge import userge, Message, pool, filters, get_collection, config
-from .. import video_chat
 from userge.utils import time_formatter, progress, runcmd, is_url, get_custom_import_re
 from userge.utils.exceptions import StopConversation
+from . import QUEUE, YTDL_PATH, VC_SESSION, MAX_DURATION, Dynamic
 
-ytdl = get_custom_import_re(video_chat.YTDL_PATH)
+ytdl = get_custom_import_re(YTDL_PATH)
 
-# https://github.com/pytgcalls/pytgcalls/blob/master/pytgcalls/mtproto/mtproto_client.py#L18
-userge.__class__.__module__ = 'pyrogram.client'
-call = PyTgCalls(userge, overload_quiet_mode=True)
+if VC_SESSION:
+    VC_CLIENT = Client(
+        VC_SESSION,
+        config.API_ID,
+        config.API_HASH)
+    # hmm ...
+    VC_CLIENT.storage.name = VC_SESSION
+else:
+    # https://github.com/pytgcalls/pytgcalls/blob/master/pytgcalls/mtproto/mtproto_client.py#L18
+    userge.__class__.__module__ = 'pyrogram.client'
+    VC_CLIENT = userge
+
+call = PyTgCalls(VC_CLIENT, overload_quiet_mode=True)
 call._env_checker.check_environment()  # pylint: disable=protected-access
-
 
 CHANNEL = userge.getCLogger(__name__)
 LOG = userge.getLogger()
 
 VC_DB = get_collection("VC_CMDS_TOGGLE")
-CMDS_FOR_ALL = False
 GROUP_CALL_PARTICIPANTS: List[int] = []
-
-ADMINS = {}
-
-PLAYING = False
 
 CHAT_NAME = ""
 CHAT_ID = 0
 CURRENT_SONG = {}
 CONTROL_CHAT_IDS: List[int] = []
-QUEUE: List[Message] = []
 CLIENT = userge
 
 BACK_BUTTON_TEXT = ""
@@ -102,10 +109,19 @@ _SCHEDULED = "[{title}]({link}) Scheduled to QUEUE on #{position} position"
 
 @userge.on_start
 async def _init():
-    global CMDS_FOR_ALL  # pylint: disable=global-statement
     data = await VC_DB.find_one({'_id': 'VC_CMD_TOGGLE'})
     if data:
-        CMDS_FOR_ALL = bool(data['is_enable'])
+        Dynamic.CMDS_FOR_ALL = bool(data['is_enable'])
+    if VC_SESSION:
+        await VC_CLIENT.start()
+        me = await VC_CLIENT.get_me()
+        LOG.info(f"Separate VC CLIENT FOUND - {me.first_name}")
+
+
+@userge.on_stop
+async def stop_vc_client():
+    if VC_SESSION:
+        await VC_CLIENT.stop()
 
 
 async def reply_text(
@@ -160,7 +176,7 @@ def check_enable_for_all(func):
         user_in_vc = msg.from_user and msg.from_user.id in GROUP_CALL_PARTICIPANTS
         sender_chat_in_vc = msg.sender_chat and msg.sender_chat.id in GROUP_CALL_PARTICIPANTS
 
-        if (is_self or (CMDS_FOR_ALL and ((user_in_vc) or (sender_chat_in_vc)))):
+        if is_self or (Dynamic.CMDS_FOR_ALL and (user_in_vc or sender_chat_in_vc)):
             await func(msg)
 
     checker.__doc__ = func.__doc__
@@ -175,7 +191,7 @@ def check_cq_for_all(func):
         is_self = cq.from_user and cq.from_user.id == userge.id
         user_in_vc = cq.from_user and cq.from_user.id in GROUP_CALL_PARTICIPANTS
 
-        if (is_self or (CMDS_FOR_ALL and user_in_vc)):
+        if is_self or (Dynamic.CMDS_FOR_ALL and user_in_vc):
             await func(cq)
         else:
             await cq.answer(
@@ -235,7 +251,7 @@ def volume_button_markup():
     allow_bots=False)
 async def joinvc(msg: Message):
     """ join video chat """
-    global CHAT_NAME, CHAT_ID, CONTROL_CHAT_IDS  # pylint: disable=global-statement
+    global CHAT_NAME, CHAT_ID  # pylint: disable=global-statement
 
     await msg.delete()
 
@@ -252,7 +268,7 @@ async def joinvc(msg: Message):
         if chat.strip("-").isnumeric():
             chat = int(chat)
         try:
-            _chat = await userge.get_chat(chat)
+            _chat = await VC_CLIENT.get_chat(chat)
         except Exception as e:
             return await reply_text(msg, f'Invalid Join In Chat Specified\n{e}')
         CHAT_ID = _chat.id
@@ -263,19 +279,33 @@ async def joinvc(msg: Message):
         if _chat.linked_chat:
             CONTROL_CHAT_IDS.append(_chat.linked_chat.id)
     else:
+        chat_id_ = msg.chat.username or msg.chat.id
+        try:
+            # caching the peer in case of public chats to play without joining for VC_SESSION_STRING
+            await VC_CLIENT.get_chat(chat_id_)
+        except (ChannelInvalid, ChannelPrivate):
+            msg_ = await reply_text(
+                msg,
+                'You are using VC_SESSION_STRING and it seems that user is '
+                'not present in this group.\ntrying to join group.')
+            join = await invite_vc_client(msg)
+            await msg_.delete()
+            if not join:
+                return
         CHAT_ID = msg.chat.id
         CHAT_NAME = msg.chat.title
     if join_as:
         if join_as.strip("-").isnumeric():
             join_as = int(join_as)
         try:
-            join_as = (await userge.get_chat(join_as)).id
+            join_as = (await VC_CLIENT.get_chat(join_as)).id
         except Exception as e:
-            CHAT_ID, CHAT_NAME, CONTROL_CHAT_IDS = 0, '', []
+            CHAT_ID, CHAT_NAME = 0, ''
+            CONTROL_CHAT_IDS.clear()
             return await reply_text(msg, f'Invalid Join As Chat Specified\n{e}')
-        join_as_peers = await userge.send(functions.phone.GetGroupCallJoinAs(
+        join_as_peers = await VC_CLIENT.send(functions.phone.GetGroupCallJoinAs(
             peer=(
-                await userge.resolve_peer(CHAT_ID)
+                await VC_CLIENT.resolve_peer(CHAT_ID)
             )
         ))
         raw_id = int(str(join_as).replace("-100", ""))
@@ -284,15 +314,16 @@ async def joinvc(msg: Message):
             or getattr(peers, "channel_id", None)
             for peers in join_as_peers.peers
         ]:
-            CHAT_ID, CHAT_NAME, CONTROL_CHAT_IDS = 0, '', []
+            CHAT_ID, CHAT_NAME = 0, ''
+            CONTROL_CHAT_IDS.clear()
             return await reply_text(msg, "You cant join the video chat as this channel.")
 
     if join_as:
-        peer = await userge.resolve_peer(join_as)
+        peer = await VC_CLIENT.resolve_peer(join_as)
     else:
-        peer = await userge.resolve_peer(userge.id)
+        peer = await VC_CLIENT.resolve_peer('me')
     try:
-        # Initialising NodeJS
+        # Initializing NodeJS
         if not call.is_connected:
             await call.start()
         # Joining with a dummy audio, since py-tgcalls wont allow joining
@@ -307,27 +338,31 @@ async def joinvc(msg: Message):
         )
     except NoActiveGroupCall:
         try:
-            peer = await userge.resolve_peer(CHAT_ID)
-            await userge.send(
+            peer = await VC_CLIENT.resolve_peer(CHAT_ID)
+            await VC_CLIENT.send(
                 functions.phone.CreateGroupCall(
                     peer=peer, random_id=2
                 )
             )
             await asyncio.sleep(3)
-            CHAT_ID, CHAT_NAME, CONTROL_CHAT_IDS = 0, '', []
+            CHAT_ID, CHAT_NAME = 0, ''
+            CONTROL_CHAT_IDS.clear()
             return await joinvc(msg)
         except Exception as err:
-            CHAT_ID, CHAT_NAME, CONTROL_CHAT_IDS = 0, '', []
-            return await reply_text(msg, err)
+            CHAT_ID, CHAT_NAME = 0, ''
+            CONTROL_CHAT_IDS.clear()
+            return await reply_text(msg, str(err))
     except (NodeJSNotInstalled, TooOldNodeJSVersion):
         return await reply_text(msg, "NodeJs is not installed or installed version is too old.")
     except AlreadyJoinedError:
         await call.leave_group_call(CHAT_ID)
         await asyncio.sleep(3)
-        CHAT_ID, CHAT_NAME, CONTROL_CHAT_IDS = 0, '', []
+        CHAT_ID, CHAT_NAME = 0, ''
+        CONTROL_CHAT_IDS.clear()
         return await joinvc(msg)
     except Exception as e:
-        CHAT_ID, CHAT_NAME, CONTROL_CHAT_IDS = 0, '', []
+        CHAT_ID, CHAT_NAME = 0, ''
+        CONTROL_CHAT_IDS.clear()
         return await reply_text(msg, f'Error during Joining the Call\n`{e}`')
 
     await _on_join()
@@ -356,19 +391,17 @@ async def leavevc(msg: Message):
 async def toggle_vc(msg: Message):
     """ toggle enable/disable vc cmds """
 
-    global CMDS_FOR_ALL  # pylint: disable=global-statement
-
     await msg.delete()
-    CMDS_FOR_ALL = not CMDS_FOR_ALL
+    Dynamic.CMDS_FOR_ALL = not Dynamic.CMDS_FOR_ALL
 
     await VC_DB.update_one(
         {'_id': 'VC_CMD_TOGGLE'},
-        {"$set": {'is_enable': CMDS_FOR_ALL}},
+        {"$set": {'is_enable': Dynamic.CMDS_FOR_ALL}},
         upsert=True
     )
 
     text = (
-        "**Enabled**" if CMDS_FOR_ALL else "**Disabled**"
+        "**Enabled**" if Dynamic.CMDS_FOR_ALL else "**Disabled**"
     ) + " commands Successfully"
 
     await reply_text(msg, text, del_in=5)
@@ -404,7 +437,7 @@ async def play_music(msg: Message, forceplay: bool):
     """ play music """
     global CLIENT  # pylint: disable=global-statement
 
-    input_str = msg.filtered_input_str
+    input_str = msg.filtered_input_str or getattr(msg.reply_to_message, 'text', '') or ''
     flags = msg.flags
     is_video = "-v" in flags
     path = Path(input_str)
@@ -415,7 +448,7 @@ async def play_music(msg: Message, forceplay: bool):
             if not details:
                 return await reply_text(msg, "**ERROR:** `Max song duration limit reached!`")
             name, duration = details
-            if PLAYING and not forceplay:
+            if Dynamic.PLAYING and not forceplay:
                 msg = await reply_text(msg, _get_scheduled_text(name, input_str))
             else:
                 msg = await reply_text(msg, f"[{name}]({input_str})")
@@ -425,7 +458,7 @@ async def play_music(msg: Message, forceplay: bool):
                 QUEUE.insert(0, msg)
             else:
                 QUEUE.append(msg)
-        elif (is_url(input_str) or (path.exists() and path.is_file())):
+        elif is_url(input_str) or (path.exists() and path.is_file()):
             if path.exists():
                 if not path.name.endswith(
                     (".mkv", ".mp4", ".webm", ".m4v", ".mp3", ".flac", ".wav", ".m4a")
@@ -470,7 +503,7 @@ async def play_music(msg: Message, forceplay: bool):
             if forceplay:
                 QUEUE.insert(0, msg)
             else:
-                if PLAYING:
+                if Dynamic.PLAYING:
                     await reply_text(msg, _get_scheduled_text(msg.file_name))
                 QUEUE.append(msg)
         else:
@@ -481,7 +514,7 @@ async def play_music(msg: Message, forceplay: bool):
                 if not details:
                     return await mesg.edit("Invalid YouTube link found during search!")
                 _, duration = details
-                if PLAYING and not forceplay:
+                if Dynamic.PLAYING and not forceplay:
                     msg = await reply_text(msg, _get_scheduled_text(title, link))
                 else:
                     msg = await msg.edit(f"[{title}]({link})")
@@ -515,17 +548,21 @@ async def play_music(msg: Message, forceplay: bool):
         else:
             return await reply_text(msg, "Replied media is invalid.")
 
+        if msg.sender_chat:
+            setattr(replied, 'sender_chat', msg.sender_chat)
+        elif msg.from_user:
+            setattr(replied, 'from_user', msg.from_user)
         CLIENT = msg.client
         if forceplay:
             QUEUE.insert(0, replied)
         else:
-            if PLAYING:
+            if Dynamic.PLAYING:
                 await reply_text(msg, _get_scheduled_text(replied_file.file_name, replied.link))
             QUEUE.append(replied)
     else:
         return await reply_text(msg, "Input not found")
 
-    if not PLAYING or forceplay:
+    if not Dynamic.PLAYING or forceplay:
         await _skip()
 
 
@@ -583,12 +620,7 @@ async def current(msg: Message):
 
     if not BACK_BUTTON_TEXT:
         return await reply_text(msg, "No song is playing!")
-    await reply_text(
-        msg,
-        BACK_BUTTON_TEXT,
-        markup=default_markup() if userge.has_bot else None,
-        to_reply=True
-    )
+    await reply_text(msg, BACK_BUTTON_TEXT, markup=default_markup() if userge.has_bot else None)
 
 
 @userge.on_cmd("queue", about={
@@ -602,10 +634,15 @@ async def view_queue(msg: Message):
     """ View Queue """
 
     if not QUEUE:
-        out = "`Queue is empty`"
+        await reply_text(msg, "`Queue is empty`")
     else:
+        list_out = []
         out = f"**{len(QUEUE)} Songs in Queue:**\n"
+
         for i, m in enumerate(QUEUE, start=1):
+            if len(out) > config.MAX_MESSAGE_LENGTH:
+                list_out.append(out)
+                out = ''
             file = m.audio or m.video or m.document or None
             if hasattr(m, 'file_name'):
                 out += f"\n{i}. {m.file_name}"
@@ -615,7 +652,10 @@ async def view_queue(msg: Message):
                 title, link = _get_yt_info(m)
                 out += f"\n{i}. [{title}]({link})"
 
-    await reply_text(msg, out)
+        list_out.append(out)
+
+        for m in list_out:
+            await reply_text(msg, m)
 
 
 @userge.on_cmd("volume", about={
@@ -658,7 +698,7 @@ async def set_volume(msg: Message):
 async def skip_music(msg: Message):
     """ skip music in vc """
     await msg.delete()
-    if not QUEUE and not PLAYING:
+    if not QUEUE and not Dynamic.PLAYING:
         return
     if (
         msg.input_str
@@ -711,17 +751,19 @@ async def seek_music_player(msg: Message):
     """ seek music x sec forward or -x sec backward """
     flags = msg.flags
     dur = msg.filtered_input_str or flags.get('-to', "0")
-    to_reply = ''
+
     try:
         dur = int(dur)
     except ValueError:
         return await reply_text(msg, "Invalid Seek time specified.")
+
     if '-to' in flags:
         seek = await seek_music(dur, True)
         to_reply = f"Jumped to {time_formatter(dur)}."
     else:
         to_reply = f"Seeked {dur} sec {'backward' if dur < 0 else 'forward'}"
         seek = await seek_music(dur)
+
     if seek:
         await reply_text(msg, to_reply)
     else:
@@ -746,6 +788,7 @@ async def replay_song_(msg: Message):
     """ replay current song from beginning """
     replay = await replay_music(flags=msg.flags)
     if replay:
+        Dynamic.PLAYING = True
         await reply_text(msg, 'Replaying current song from beginning.')
     else:
         await reply_text(msg, 'No songs found to play.')
@@ -771,6 +814,19 @@ async def resume_music(msg: Message):
     await reply_text(msg, "◀️ **Resumed** Music Successfully")
 
 
+@userge.on_cmd("shuffle", about={
+    'header': "Shuffle songs in queue.",
+    'usage': "{tr}shuffle"},
+    trigger=config.PUBLIC_TRIGGER, check_client=True,
+    filter_me=False, allow_bots=False)
+@vc_chat
+@check_enable_for_all
+async def shuffle_queue(msg: Message):
+    if QUEUE:
+        random.shuffle(QUEUE)
+    await view_queue(msg)
+
+
 @userge.on_cmd("stopvc", about={
     'header': "Stop vc and clear Queue.",
     'usage': "{tr}stopvc"})
@@ -782,13 +838,13 @@ async def stop_music(msg: Message):
     await reply_text(msg, "`Stopped Userge-Music.`", del_in=5)
 
 
-@userge.on_raw_update()
+@VC_CLIENT.on_raw_update()
 async def _on_raw(_, m: BaseMessage, *__) -> None:
     if isinstance(m, UpdateGroupCallParticipants):
         # TODO: chat_id
         for participant in m.participants:
             if participant.is_self:
-                group_call = await userge.send(
+                group_call = await VC_CLIENT.send(
                     GetGroupCall(call=InputGroupCall(
                         access_hash=m.call.access_hash,
                         id=m.call.id), limit=1)
@@ -818,7 +874,7 @@ async def _on_join(group_call: Optional[GroupCall] = None) -> None:
 
 
 async def _on_left(group_call: Optional[GroupCall] = None) -> None:
-    global CHAT_NAME, CHAT_ID, PLAYING, BACK_BUTTON_TEXT  # pylint: disable=global-statement
+    global CHAT_NAME, CHAT_ID, BACK_BUTTON_TEXT  # pylint: disable=global-statement
 
     if group_call:
         LOG.info("Left group call: [%s], participants: [%s]",
@@ -832,7 +888,7 @@ async def _on_left(group_call: Optional[GroupCall] = None) -> None:
     QUEUE.clear()
     CURRENT_SONG.clear()
     GROUP_CALL_PARTICIPANTS.clear()
-    PLAYING = False
+    Dynamic.PLAYING = False
     BACK_BUTTON_TEXT = ""
     if CQ_MSG:
         for msg in CQ_MSG:
@@ -843,6 +899,7 @@ async def _on_left(group_call: Optional[GroupCall] = None) -> None:
 @call.on_stream_end()
 async def _stream_end_handler(_: PyTgCalls, update: Update):
     if isinstance(update, StreamAudioEnded):
+        Dynamic.PLAYING = False
         await _skip()
 
 
@@ -855,17 +912,17 @@ async def _participants_change_handler(_: PyTgCalls, update: Update):
 
 
 async def _skip(clear_queue: bool = False):
-    global PLAYING  # pylint: disable=global-statement
-
-    if PLAYING:
-        # skip current playing song the play next
+    if Dynamic.PLAYING:
+        # skip current playing song to play next
+        Dynamic.PLAYING = False
         await call.change_stream(
             CHAT_ID,
             AudioPiped(
-                'http://duramecho.com/Misc/SilentCd/Silence01s.mp3'
+                "http://duramecho.com/Misc/SilentCd/Silence{}s.mp3".format(
+                    '01' if not QUEUE or clear_queue else '32'
+                )
             )
         )
-    PLAYING = True
 
     if CQ_MSG:
         for msg in CQ_MSG:
@@ -876,19 +933,19 @@ async def _skip(clear_queue: bool = False):
         QUEUE.clear()
 
     if not QUEUE:
-        PLAYING = False
         return
 
     shutil.rmtree("temp_music_dir", ignore_errors=True)
     msg = QUEUE.pop(0)
 
     try:
+        Dynamic.PLAYING = True
         if msg.audio or msg.video or msg.document or hasattr(msg, "file_name"):
             await tg_down(msg)
         else:
             await yt_down(msg)
     except Exception as err:
-        PLAYING = False
+        Dynamic.PLAYING = False
         out = f'**ERROR:** `{err}`'
         await CHANNEL.log(f"`{format_exc().strip()}`")
         if QUEUE:
@@ -910,7 +967,7 @@ async def seek_music(dur: int, jump: bool = False) -> bool:
     else:
         seek_point = max(0, (time.time() - CURRENT_SONG['start'] + dur))
         # adjusting seek time in start time
-        CURRENT_SONG['start'] = CURRENT_SONG['start'] - dur
+        CURRENT_SONG['start'] -= dur
     if seek_point > CURRENT_SONG['duration']:
         return False
     if CURRENT_SONG['is_video']:
@@ -933,6 +990,7 @@ async def replay_music(flags: dict = None) -> bool:
     is_video = False
     if flags and '-v' in flags:
         is_video = CURRENT_SONG['has_video']
+        CURRENT_SONG['is_video'] = is_video
     elif flags and '-a' in flags:
         is_video = False
     else:
@@ -954,6 +1012,31 @@ async def replay_music(flags: dict = None) -> bool:
     return True
 
 
+async def invite_vc_client(msg: Message) -> bool:
+    """ Invites the VC_CLIENT to the current chat. """
+    invite_link = msg.filtered_input_str
+    if not invite_link:
+        try:
+            link = await msg.client.create_chat_invite_link(msg.chat.id)
+        except ChatAdminRequired:
+            await reply_text(msg, '`Provide a invite link along command.!!`')
+            return False
+        else:
+            invite_link = link.invite_link
+    try:
+        await VC_CLIENT.join_chat(invite_link)
+    except UserAlreadyParticipant:
+        await reply_text(msg, 'User already present in this chat')
+    except UserBannedInChannel:
+        await reply_text(msg, 'Unable to join this chat since user is banned here.')
+    except Exception as e:
+        await reply_text(msg, f'**ERROR**: {e}')
+    else:
+        await reply_text(msg, 'VC_CLIENT Successfully joined.')
+        return True
+    return False
+
+
 async def yt_down(msg: Message):
     """ youtube downloader """
 
@@ -968,7 +1051,7 @@ async def yt_down(msg: Message):
 
     flags = msg.flags
     is_video = "-v" in flags
-    duration = flags.get("duration")
+    duration = int(flags.get("duration"))
     quality = max(min(100, int(flags.get('-q', 100))), 1)
     height, width, has_audio, has_video = await get_file_info(stream_link)
 
@@ -1027,6 +1110,7 @@ async def tg_down(msg: Message):
     message = await reply_text(
         msg, f"`{'Preparing' if hasattr(msg, 'file_name') else 'Downloading'} {title}`"
     )
+    duration = 0
     if not hasattr(msg, "path_to_media"):
         path = await msg.client.download_media(
             message=msg,
@@ -1041,7 +1125,7 @@ async def tg_down(msg: Message):
     else:
         filename = msg.path_to_media
         duration = await get_duration(shlex.quote(msg.path_to_media))
-    if duration > video_chat.MAX_DURATION:
+    if duration > MAX_DURATION:
         await reply_text(msg, "**ERROR:** `Max song duration limit reached!`")
         return await _skip()
     if hasattr(msg, 'file_info'):
@@ -1161,13 +1245,14 @@ async def get_stream_link(link: str) -> str:
 
 
 async def get_duration(file: str) -> int:
-    dur = 0
     cmd = "ffprobe -i {file} -v error -show_entries format=duration -of json -select_streams v:0"
     out, _, _, _ = await runcmd(cmd.format(file=file))
+
     try:
         out = json.loads(out)
     except JSONDecodeError:
-        dur = 0
+        pass
+
     dur = int(float((out.get("format", {})).get("duration", 0)))
     return dur
 
@@ -1256,7 +1341,7 @@ def _get_song_info(url: str):
         info = ydl.extract_info(url, download=False)
         duration = info.get("duration") or 0
 
-        if duration > video_chat.MAX_DURATION:
+        if duration > MAX_DURATION:
             return False
     return info.get("title"), duration if duration else 0
 
@@ -1296,6 +1381,10 @@ if userge.has_bot:
                 out = f"**{len(QUEUE)} Song"
                 out += f"{'s' if len(QUEUE) > 1 else ''} in Queue:**\n"
                 for i, m in enumerate(QUEUE, start=1):
+                    if len(out) > config.MAX_MESSAGE_LENGTH - 100:
+                        out += ('\nQueue too Long, '
+                                'can not display more songs because of telegram restrictions.')
+                        break
                     file = m.audio or m.video or m.document or None
                     if hasattr(m, 'file_name'):
                         out = f"\n{i}. {m.file_name}"
